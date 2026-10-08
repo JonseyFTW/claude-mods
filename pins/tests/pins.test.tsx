@@ -129,3 +129,68 @@ test('done todos show as completed, then leave when the turn ends', async ($, on
   await $.tool.call({ tool: 'TodoWrite', todos: [{ content: 'Write docs', status: 'completed', activeForm: 'Writing docs' }] })
   expect(await board($)).toEqual(['- [t2] todo: Refresh page'])
 })
+
+const STOP = { stop_hook_active: false } as never
+
+test("Stop blocks once for Claude's open todos; done clears them at turn end; no second block", async ($, on) => {
+  on('session.root', () => ({ value: 'C:\Proj' }))
+  on('store.set', () => ({ value: undefined }))
+  on('turn.complete', () => ({ text: '' }))
+  on('classic.Stop', () => ({}))
+  on('prompt.submit', (_$, e) => ({ text: e.text }))
+
+  await $.tool.call({
+    tool: 'mcp__pins__update',
+    add: [{ kind: 'todo', text: 'Run migration', owner: 'claude' }, { kind: 'todo', text: 'Phone-test' }],
+  })
+  expect(await board($)).toEqual(['- [t1] claude todo: Run migration', '- [t2] todo: Phone-test'])
+  const ui = await $.ui.mount({ plugin: 'pins', surface: 'terminal', ...PANE })
+  expect(await ui.find({ type: 'Text', text: '[c]' })).toBeDefined()
+  await ui.unmount()
+
+  // turn 1: blocked once, listing only Claude's todo; Claude marks it done
+  const first = await $.classic.Stop(STOP)
+  expect(first.block).toContain('- [t1] Run migration')
+  expect(first.block).not.toContain('Phone-test')
+  await $.tool.call({ tool: 'mcp__pins__update', done: ['t1'] })
+  expect((await $.classic.Stop(STOP)).block).toBeUndefined()
+  expect((await board($))[0]).toBe('- [t1] claude todo (completed): Run migration')
+  await $.turn.complete(TURN_END)
+  expect(await board($)).toEqual(['- [t2] todo: Phone-test'])
+
+  // turn 2: a new Claude todo, blocked once; Claude replies without update, the turn ends with no second block
+  await $.prompt.submit({ text: 'next thing', origin: { kind: 'composer' }, wait: false })
+  await $.tool.call({ tool: 'mcp__pins__update', add: [{ kind: 'todo', text: 'Write docs', owner: 'claude' }] })
+  expect((await $.classic.Stop(STOP)).block).toContain('Write docs')
+  expect((await $.classic.Stop(STOP)).block).toBeUndefined()
+})
+
+test('user todos and old todos without an owner never trigger the Stop check', async ($, on) => {
+  on('session.root', () => ({ value: 'C:\Proj' }))
+  on('store.set', () => ({ value: undefined }))
+  on('classic.Stop', () => ({}))
+  // a board saved before owners existed
+  on('store.get', () => ({ value: [{ id: 't1', kind: 'todo', text: 'Old todo' }] }))
+  on('command.register', () => ({ value: { command: 'pins' } }))
+  on('tool.register', () => ({ value: { tool: 'mcp__pins__update' } }))
+  on('session.start', () => ({ cwd: 'C:\\Proj' }))
+  await $.session.start({ cwd: 'C:\\Proj', surface: 'terminal', isInteractive: true })
+
+  await $.tool.call({ tool: 'mcp__pins__update', add: [{ kind: 'todo', text: 'Phone-test', owner: 'user' }] })
+  expect(await board($)).toEqual(['- [t1] todo: Old todo', '- [t2] todo: Phone-test'])
+  expect((await $.classic.Stop(STOP)).block).toBeUndefined()
+})
+
+test('a decision id or quote inside a pasted block does not clear it; typed by the user it does', async ($, on) => {
+  on('session.root', () => ({ value: 'C:\Proj' }))
+  on('store.set', () => ({ value: undefined }))
+  on('prompt.submit', (_$, e) => ({ text: e.text }))
+
+  await $.tool.call({ tool: 'mcp__pins__update', add: [{ kind: 'decision', text: 'Which DB?' }, { kind: 'decision', text: 'Ship today?' }] })
+  const pasted = 'see this\n<pasted_content id="ab12">\nd2: yes\n> Which DB?\n</pasted_content id="ab12">\nthoughts?'
+  await $.prompt.submit({ text: pasted, origin: { kind: 'composer' }, wait: false })
+  expect(await board($)).toEqual(['- [d1] decision: Which DB?', '- [d2] decision: Ship today?'])
+
+  await $.prompt.submit({ text: 'd2: yes', origin: { kind: 'composer' }, wait: false })
+  expect(await board($)).toEqual(['- [d1] decision: Which DB?'])
+})

@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Register } from 'claude-code'
 
-import type { Pin, PinKind, PinStatus } from '../types'
+import type { Pin, PinKind, PinOwner, PinStatus } from '../types'
 
 const PANE = 'pins'
 const TOOL = 'mcp__pins__update'
@@ -12,8 +12,12 @@ const items = atom(ITEMS, [])
 const answering = atom({ plugin: 'pins', key: 'answering' } as const, null)
 // Prompts a person typed (terminal, phone, desktop); notifications, peers and plugins never answer a decision
 const PERSON = new Set(['composer', 'bridge', 'sdk'])
+// Set once the Stop check has asked Claude about its open todos; cleared by the next prompt, so it asks at most once per turn
+const nudged = atom({ plugin: 'pins', key: 'nudged' } as const, false)
+// Pasted blocks are not the user's own words, so they never answer a decision
+const PASTED = /<pasted_content[^>]*>[\s\S]*?<\/pasted_content[^>]*>/g
 
-type AddInput = { kind: PinKind; text: string; url?: string }
+type AddInput = { kind: PinKind; text: string; url?: string; owner?: PinOwner }
 
 // ponytail: ids are kind letter + next number; built-in todos use tw<n>/task<taskId> (non-numeric after the letter) so they never collide
 const nextId = (list: Pin[], kind: PinKind) =>
@@ -28,7 +32,7 @@ const capLinks = (list: Pin[]) => {
 const boardText = (list: Pin[]) =>
   list.length === 0
     ? '(empty)'
-    : list.map(p => `- [${p.id}] ${p.kind}${p.status ? ` (${p.status})` : ''}: ${p.text}${p.url ? ` <${p.url}>` : ''}`).join('\n')
+    : list.map(p => `- [${p.id}] ${p.owner === 'claude' ? 'claude ' : ''}${p.kind}${p.status ? ` (${p.status})` : ''}: ${p.text}${p.url ? ` <${p.url}>` : ''}`).join('\n')
 
 // The board is saved per project folder. Built-in task todos (tw*/task*) belong to one session, so they are not saved.
 const boardKey = async ($: EngineInterface) => `board:${(await $.session.root()).toLowerCase()}`
@@ -53,7 +57,10 @@ export const register: Register = on => {
         'Update the pins pane the user sees beside the chat. Add a decision when you need an answer or choice from the user; ' +
         'remove it once they answer. Add links the user will want later (PRs, artifacts, docs, tickets). ' +
         'Add todos the user owns that are not in your task list. Remove items by id when done or stale. ' +
-        'Mark a todo done with `done` in the same turn you finish it; remove a decision as soon as the user answers it.',
+        'Mark a todo done with `done` in the same turn you finish it; remove a decision as soon as the user answers it. ' +
+        'Set `owner: "claude"` on a todo for work you will do yourself; leave owner as "user" for actions the user takes. ' +
+        'When TodoWrite is available, track your own work there instead of adding owner "claude" todos: the pane already ' +
+        'mirrors TodoWrite and clears finished items itself. Owner "claude" todos are the fallback when TodoWrite is not available.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -65,6 +72,7 @@ export const register: Register = on => {
                 kind: { enum: ['decision', 'todo', 'link'] },
                 text: { type: 'string', description: 'One short line' },
                 url: { type: 'string', description: 'Required for links' },
+                owner: { enum: ['user', 'claude'], description: 'Todos only: who does it; "user" when left out' },
               },
               required: ['kind', 'text'],
             },
@@ -95,7 +103,8 @@ export const register: Register = on => {
         .map(p => (p.kind === 'todo' && done.has(p.id) ? { ...p, status: 'completed' as const } : p))
       for (const a of input.add ?? []) {
         if (a.kind === 'link' && !a.url) continue
-        out = [...out, { id: nextId(out, a.kind), kind: a.kind, text: a.text, url: a.url }]
+        const owner = a.kind === 'todo' ? (a.owner === 'claude' ? 'claude' : 'user') : undefined
+        out = [...out, { id: nextId(out, a.kind), kind: a.kind, text: a.text, url: a.url, owner }]
       }
       return capLinks(out)
     })
@@ -159,10 +168,12 @@ export const register: Register = on => {
   // A submitted answer clears its decision: the one clicked in the pane, one quoted ("> text"), or one named by id ("d1").
   // ponytail: removed before next(e) so the turn's first request already sees the board without it; put back if the prompt is dropped
   on('prompt.submit', async ($, e, next) => {
+    await update($, nudged, () => false)
     if (!e.text.trim() || !PERSON.has(e.origin.kind)) return next(e)
+    const typed = e.text.replace(PASTED, '')
     const clicked = await read($, answering)
-    const quoted = new Set(e.text.split('\n').filter(l => l.startsWith('> ')).map(l => l.slice(2).trim()))
-    const named = new Set(e.text.match(/\bd\d+\b/g) ?? [])
+    const quoted = new Set(typed.split('\n').filter(l => l.startsWith('> ')).map(l => l.slice(2).trim()))
+    const named = new Set(typed.match(/\bd\d+\b/g) ?? [])
     const answered = (await read($, items)).filter(
       p => p.kind === 'decision' && (p.id === clicked || quoted.has(p.text.trim()) || named.has(p.id)),
     )
@@ -184,6 +195,20 @@ export const register: Register = on => {
     return next(e)
   })
 
+  // Claude's own todos don't rely on its memory: before the turn ends, it is asked once about the ones still open.
+  // ponytail: at most one block per turn (nudged resets on the next prompt); a second Stop always passes, so no loops
+  on('classic.Stop', async ($, e, next) => {
+    const ran = await next(e)
+    if (ran.block !== undefined || (await read($, nudged))) return ran
+    const open = (await read($, items)).filter(p => p.kind === 'todo' && p.owner === 'claude' && p.status !== 'completed')
+    if (open.length === 0) return ran
+    await update($, nudged, () => true)
+    const block =
+      `Your pinned todos are still open:\n${open.map(p => `- [${p.id}] ${p.text}`).join('\n')}\n` +
+      `For each one you finished, call ${TOOL} with \`done\` listing its id. Leave unfinished ones open; nothing else is needed.`
+    return { ...ran, block }
+  })
+
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
     const { Box, Text, Button, Link } = $.ui.resolve(e)
     const list = await read($, items)
@@ -201,6 +226,7 @@ export const register: Register = on => {
       <Box key={p.id} flexDirection="row" gap={1}>
         <Button key={`x-${p.id}`} label="x" plain onPress={() => dismiss(p.id)} />
         {p.kind === 'todo' && <Text>{p.status === 'completed' ? '✓' : p.status === 'in_progress' ? '▸' : '○'}</Text>}
+        {p.owner === 'claude' && <Text dimColor>[c]</Text>}
         {p.kind === 'link' && p.url ? (
           <Link href={p.url}>{p.text}</Link>
         ) : p.kind === 'decision' ? (
