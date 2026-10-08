@@ -4,6 +4,6 @@ export type Pin = { id: string; kind: PinKind; text: string; url?: string; statu
 
 declare module 'claude-code' {
   interface PluginState {
-    pins: { items: Pin[] }
+    pins: { items: Pin[]; answering: string | null }
   }
 }

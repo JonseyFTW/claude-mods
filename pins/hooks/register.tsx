@@ -8,6 +8,10 @@ const TOOL = 'mcp__pins__update'
 const MAX_LINKS = 12
 const ITEMS = { plugin: 'pins', key: 'items' } as const
 const items = atom(ITEMS, [])
+// The decision the user clicked in the pane, cleared once they submit an answer
+const answering = atom({ plugin: 'pins', key: 'answering' } as const, null)
+// Prompts a person typed (terminal, phone, desktop); notifications, peers and plugins never answer a decision
+const PERSON = new Set(['composer', 'bridge', 'sdk'])
 
 type AddInput = { kind: PinKind; text: string; url?: string }
 
@@ -48,7 +52,8 @@ export const register: Register = on => {
       description:
         'Update the pins pane the user sees beside the chat. Add a decision when you need an answer or choice from the user; ' +
         'remove it once they answer. Add links the user will want later (PRs, artifacts, docs, tickets). ' +
-        'Add todos the user owns that are not in your task list. Remove items by id when done or stale.',
+        'Add todos the user owns that are not in your task list. Remove items by id when done or stale. ' +
+        'Mark a todo done with `done` in the same turn you finish it; remove a decision as soon as the user answers it.',
       inputSchema: {
         type: 'object',
         properties: {
@@ -65,6 +70,7 @@ export const register: Register = on => {
             },
           },
           remove: { type: 'array', items: { type: 'string' }, description: 'Ids to remove' },
+          done: { type: 'array', items: { type: 'string' }, description: 'Todo ids finished; shown as done, removed when the turn ends' },
         },
       },
     })
@@ -79,11 +85,14 @@ export const register: Register = on => {
     })
 
   on('tool.call', { tool: TOOL }, async ($, e) => {
-    const input = e as { add?: AddInput[]; remove?: string[] }
+    const input = e as { add?: AddInput[]; remove?: string[]; done?: string[] }
     const gone = new Set(input.remove ?? [])
+    const done = new Set(input.done ?? [])
     const wasEmpty = (await read($, items)).length === 0
     const list = await change($, old => {
-      let out = old.filter(p => !gone.has(p.id))
+      let out = old
+        .filter(p => !gone.has(p.id))
+        .map(p => (p.kind === 'todo' && done.has(p.id) ? { ...p, status: 'completed' as const } : p))
       for (const a of input.add ?? []) {
         if (a.kind === 'link' && !a.url) continue
         out = [...out, { id: nextId(out, a.kind), kind: a.kind, text: a.text, url: a.url }]
@@ -100,7 +109,12 @@ export const register: Register = on => {
     const ran = await next(e)
     if (ran.deny === undefined && !ran.isError) {
       const todos: Pin[] = e.todos.map((t, i) => ({ id: `tw${i + 1}`, kind: 'todo', text: t.content, status: t.status }))
-      await change($, old => [...old.filter(p => !p.id.startsWith('tw')), ...todos])
+      // ponytail: TodoWrite resends finished items every call; a completed one stays only while its pin is still on the board,
+      // so one cleared at turn.complete does not come back
+      await change($, old => {
+        const shown = new Set(old.filter(p => p.id.startsWith('tw')).map(p => p.text))
+        return [...old.filter(p => !p.id.startsWith('tw')), ...todos.filter(t => t.status !== 'completed' || shown.has(t.text))]
+      })
     }
     return ran
   })
@@ -135,9 +149,39 @@ export const register: Register = on => {
     const text =
       `The user has a Pins pane beside the chat with open decisions, todos and links. Keep it current with ${TOOL}. ` +
       'When you end a turn asking the user a question or for a choice only they can make, pin it as a decision. ' +
-      'When the user answers, remove that decision. Pin URLs you create or that the user will want later as links.\n' +
+      'When the user answers, remove that decision. Pin URLs you create or that the user will want later as links. ' +
+      "At the start of each turn, if the user's message answers an open decision, remove it before doing anything else. " +
+      'When you finish a pinned todo, mark it done in that same turn, not later.\n' +
       `Current board:\n${boardText(list)}`
     return { sections: [...composed.sections, { id: 'pins:board', scope: 'session', text }] }
+  })
+
+  // A submitted answer clears its decision: the one clicked in the pane, one quoted ("> text"), or one named by id ("d1").
+  // ponytail: removed before next(e) so the turn's first request already sees the board without it; put back if the prompt is dropped
+  on('prompt.submit', async ($, e, next) => {
+    if (!e.text.trim() || !PERSON.has(e.origin.kind)) return next(e)
+    const clicked = await read($, answering)
+    const quoted = new Set(e.text.split('\n').filter(l => l.startsWith('> ')).map(l => l.slice(2).trim()))
+    const named = new Set(e.text.match(/\bd\d+\b/g) ?? [])
+    const answered = (await read($, items)).filter(
+      p => p.kind === 'decision' && (p.id === clicked || quoted.has(p.text.trim()) || named.has(p.id)),
+    )
+    const ids = new Set(answered.map(p => p.id))
+    if (ids.size) await change($, old => old.filter(p => !ids.has(p.id)))
+    const entered = await next(e)
+    if (entered.drop !== undefined) {
+      if (ids.size) await change($, old => [...old, ...answered.filter(a => !old.some(p => p.id === a.id))])
+      return entered
+    }
+    if (clicked !== null) await update($, answering, () => null)
+    return entered
+  })
+
+  // Finished todos show ✓ for the rest of the turn they finished in, then leave.
+  on('turn.complete', async ($, e, next) => {
+    if (!e.agentId && (await read($, items)).some(p => p.status === 'completed'))
+      await change($, old => old.filter(p => p.status !== 'completed'))
+    return next(e)
   })
 
   on('ui.render', { component: 'Pane', requestId: PANE }, async ($, e) => {
@@ -146,6 +190,7 @@ export const register: Register = on => {
     const dismiss = (id: string) => change($, old => old.filter(p => p.id !== id))
     // Clicking a decision quotes it into the prompt box; the clipboard is the fallback where the box refuses (e.g. a dialog is up)
     const answer = async (p: Pin, surface: string) => {
+      await update($, answering, () => p.id)
       const filled = await $.prompt.fill({ text: `> ${p.text}\n\n`, mode: 'insert' })
       if (filled.isFilled) return
       const copied = await $.ui.copy({ text: p.text, surface })
