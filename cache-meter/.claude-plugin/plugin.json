@@ -1,0 +1,6 @@
+{
+  "name": "cache-meter",
+  "version": "0.1.0",
+  "description": "Band above the prompt showing whether the prompt cache is warm, time left, and last turn's hit rate",
+  "types": "./types/index.d.ts"
+}

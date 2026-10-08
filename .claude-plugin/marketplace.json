@@ -1,5 +1,8 @@
 {
-  "name": "pins",
+  "name": "jonsey-mods",
   "owner": { "name": "JonseyFTW" },
-  "plugins": [{ "name": "pins", "source": "./" }]
+  "plugins": [
+    { "name": "pins", "source": "./pins" },
+    { "name": "cache-meter", "source": "./cache-meter" }
+  ]
 }
