@@ -1,0 +1,6 @@
+{
+  "name": "pins",
+  "version": "0.1.0",
+  "description": "Side pane of open decisions, todos and links for the current session",
+  "types": "./types/index.d.ts"
+}
